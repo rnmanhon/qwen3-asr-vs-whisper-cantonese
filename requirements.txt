@@ -1,0 +1,10 @@
+av==18.1.0
+faster-whisper==1.2.1
+ctranslate2==4.8.5
+numpy==1.26.4
+OpenCC==1.4.2
+requests==2.34.2
+# OpenAI Whisper comparison (the `openai` subcommand); install a PyTorch build for your platform first
+openai-whisper==20231117
+# Qwen3-ASR in-process (the `qwen-local` subcommand)
+transformers>=5.13
