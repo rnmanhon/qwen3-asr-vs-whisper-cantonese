@@ -69,6 +69,11 @@ python benchmark.py qwen --data data --url http://127.0.0.1:8000
 #    Needs a CPU with BF16 support to be fast; use --dtype float32 otherwise.
 python benchmark.py qwen-local --data data --device cpu --dtype bfloat16 --threads 8
 
+#    Qwen3-ASR through llama.cpp's llama-server (any GPU with Vulkan: AMD, Intel, NVIDIA).
+#    --wav: llama-server decodes only WAV/MP3/FLAC; the "language …<asr_text>" prefix it returns is
+#    stripped. --limit 30: the first 30 clips only, as in our Windows timings (see RESULTS.md).
+python benchmark.py qwen --data data --url http://127.0.0.1:8090 --wav --limit 30 --name llama_vulkan_q8_0
+
 # 4. Score every result file in data/results/ -> data/report.json
 python benchmark.py score --data data
 
@@ -86,6 +91,27 @@ offline use. `python benchmark.py <command> -h` lists every option.
 Timing note: the `whisper`, `openai`, `qwen` and `qwen-local` commands time each request including audio decoding.
 Our published CPU timings excluded decoding and used 30 clips, each configuration measured alone;
 expect small differences.
+
+### llama.cpp's llama-server
+
+Tested with build b12211 (Windows, Vulkan) and `ggml-org/Qwen3-ASR-1.7B-GGUF`:
+
+```sh
+llama-server -m Qwen3-ASR-1.7B-Q8_0.gguf --mmproj mmproj-Qwen3-ASR-1.7B-Q8_0.gguf \
+  --alias qwen3-asr -ngl 99 -c 8192 -np 1 --host 127.0.0.1 --port 8090
+```
+
+Always pass `-c 8192 -np 1`: without them llama-server sizes its context to fill the card and takes
+nearly all VRAM (one clip needs a few hundred tokens). With them, Q8_0 used 3.6 GB and BF16 5.4 GB.
+For several requests at once, raise both together (`-np 4 -c 16384`).
+
+Without a usable GPU, llama.cpp's CPU build (e.g. the `ghcr.io/ggml-org/llama.cpp:server-b12211`
+image) with Q8_0 was 3.2× faster than Transformers on a Ryzen 7 3700X. Pass `-t` = the number of
+physical cores: using every logical processor was 2.8× slower.
+
+Calling it from your own code: send 16 kHz WAV, send `language=yue` (short fragments are otherwise
+often guessed as another language), strip the `language …<asr_text>` prefix, and skip near-silent
+clips (quiet hiss can return the model's own prompt, `Transcribe audio to text.`).
 
 ## How it scores
 

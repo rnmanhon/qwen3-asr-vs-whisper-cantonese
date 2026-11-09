@@ -123,11 +123,15 @@ def cmd_prepare(a):
     print(f"prepared {len(meta)} clips ({sum(m['dur'] for m in meta) / 60:.1f} min) and {len(probes)} probes")
 
 
-def all_items(P):
+def all_items(P, limit=0):
+    """All clips plus the probes; with limit, only the first `limit` clips (no probes), as in the
+    30-clip timing runs."""
     meta = json.load(open(P["meta"]))
+    clips = [(m["id"], os.path.join(P["clips"], m["id"] + ".webm")) for m in meta]
+    if limit:
+        return clips[:limit]
     probes = json.load(open(P["probe_meta"]))
-    return [(m["id"], os.path.join(P["clips"], m["id"] + ".webm")) for m in meta] + \
-           [(p["id"], os.path.join(P["probes"], p["id"] + ".webm")) for p in probes]
+    return clips + [(p["id"], os.path.join(P["probes"], p["id"] + ".webm")) for p in probes]
 
 
 # ---------------------------------------------------------------- engines
@@ -181,22 +185,43 @@ def qwen_local_fn(a):
     return fn
 
 
+# Qwen3-ASR's raw output starts with "language <name><asr_text>"; vLLM removes it, llama.cpp's
+# llama-server doesn't.
+ASR_TAG = re.compile(r"^\s*language\s+[^<]*?<asr_text>", re.IGNORECASE)
+
+
+def wav_16k(data: bytes) -> bytes:
+    """Any audio file -> 16 kHz mono 16-bit WAV (llama-server decodes only WAV/MP3/FLAC itself)."""
+    import wave
+    pcm = decode_to_16k(data)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR)
+        w.writeframes((np.clip(pcm, -1, 1) * 32767).astype("<i2").tobytes())
+    return buf.getvalue()
+
+
 def qwen_fn(a):
+    """An OpenAI-compatible Qwen3-ASR server: vLLM, or llama.cpp's llama-server (use --wav)."""
     import requests
     sess = requests.Session()
     url = a.url.rstrip("/") + "/v1/audio/transcriptions"
 
     def fn(path):
         with open(path, "rb") as f:
-            r = sess.post(url, data={"model": a.served_model, "language": "yue"},
-                          files={"file": (os.path.basename(path), f, "audio/webm")}, timeout=120)
+            audio = f.read()
+        name, ctype = os.path.basename(path), "audio/webm"
+        if a.wav:  # converted inside the timer, as an application would per request (~10 ms)
+            audio, name, ctype = wav_16k(audio), "clip.wav", "audio/wav"
+        r = sess.post(url, data={"model": a.served_model, "language": "yue"},
+                      files={"file": (name, audio, ctype)}, timeout=300)
         r.raise_for_status()
-        return r.json().get("text", "")
+        return ASR_TAG.sub("", r.json().get("text", ""), count=1)
     return fn
 
 
-def transcribe_all(P, fn, name):
-    items = all_items(P)
+def transcribe_all(P, fn, name, limit=0):
+    items = all_items(P, limit)
     fn(items[0][1])  # warm-up
     out = {}
     for cid, path in items:
@@ -208,26 +233,27 @@ def transcribe_all(P, fn, name):
         out[cid] = {"text": text, "sec": round(time.perf_counter() - t, 3)}
     os.makedirs(P["results"], exist_ok=True)
     json.dump(out, open(os.path.join(P["results"], name + ".json"), "w"), ensure_ascii=False, indent=0)
-    print(name, "done:", len(out), "items")
+    secs = sorted(v["sec"] for v in out.values())
+    print(name, "done:", len(out), "items; median", secs[len(secs) // 2], "s per item")
 
 
 def cmd_whisper(a):
     P = paths(a.data)
     model = load_whisper(a)
     for cfg in a.config:
-        transcribe_all(P, whisper_fn(model, cfg), f"whisper_{a.device}_{a.compute_type}_{cfg}")
+        transcribe_all(P, whisper_fn(model, cfg), f"whisper_{a.device}_{a.compute_type}_{cfg}", a.limit)
 
 
 def cmd_openai(a):
-    transcribe_all(paths(a.data), openai_fn(a), f"openai_{a.device}_{'fp16' if a.fp16 else 'fp32'}_greedy")
+    transcribe_all(paths(a.data), openai_fn(a), f"openai_{a.device}_{'fp16' if a.fp16 else 'fp32'}_greedy", a.limit)
 
 
 def cmd_qwen(a):
-    transcribe_all(paths(a.data), qwen_fn(a), a.name)
+    transcribe_all(paths(a.data), qwen_fn(a), a.name, a.limit)
 
 
 def cmd_qwen_local(a):
-    transcribe_all(paths(a.data), qwen_local_fn(a), f"qwen3_asr_local_{a.device}_{a.dtype}")
+    transcribe_all(paths(a.data), qwen_local_fn(a), f"qwen3_asr_local_{a.device}_{a.dtype}", a.limit)
 
 
 # ---------------------------------------------------------------- scoring
@@ -305,7 +331,8 @@ def cmd_score(a):
         N = S = D = I = 0
         by_age, secs = {}, []
         canto_ref = canto_hit = mand_extra = 0
-        for m in meta:
+        scored = [m for m in meta if m["id"] in res]  # a --limit run has only the first N clips
+        for m in scored:
             r = res[m["id"]]
             ref, hyp = refs[m["id"]], norm(r["text"], cc)
             s, d, i = sdi(ref, hyp)
@@ -320,15 +347,16 @@ def cmd_score(a):
                 canto_hit += min(ref.count(ch), hyp.count(ch))
             for ch in MANDARIN:
                 mand_extra += max(0, hyp.count(ch) - ref.count(ch))
-        silent = {p["id"]: res[p["id"]]["text"] for p in probes if p["kind"] != "partial"}
+        silent = {p["id"]: res[p["id"]]["text"] for p in probes if p["kind"] != "partial" and p["id"] in res}
         invented = total = 0
         for p in probes:
-            if p["kind"] == "partial":
+            if p["kind"] == "partial" and p["id"] in res:
                 h = norm(res[p["id"]]["text"], cc)
                 total += len(h)
                 invented += sum(1 for ch in h if ch not in refs[p["src"]])
         secs.sort()
         report[eng] = {
+            "clips": len(scored),
             "CER": round(100 * (S + D + I) / N, 2),
             "substitutions": round(100 * S / N, 2), "deletions": round(100 * D / N, 2), "insertions": round(100 * I / N, 2),
             "CER_by_age": {k: {"CER": round(100 * v[0] / v[1], 2), "clips": v[2]} for k, v in sorted(by_age.items())},
@@ -339,7 +367,7 @@ def cmd_score(a):
             "partial_clip_invented_char_pct": round(100 * invented / max(total, 1), 1),
         }
         r = report[eng]
-        print(f"{eng}: CER {r['CER']}% (S {r['substitutions']} D {r['deletions']} I {r['insertions']})  "
+        print(f"{eng} ({r['clips']} clips): CER {r['CER']}% (S {r['substitutions']} D {r['deletions']} I {r['insertions']})  "
               f"Cantonese kept {r['cantonese_char_retention_pct']}%  silence/noise with text "
               f"{len(r['silence_noise_with_text'])}/{len(silent)}  partial invented {r['partial_clip_invented_char_pct']}%")
     json.dump(report, open(os.path.join(a.data, "report.json"), "w"), ensure_ascii=False, indent=1)
@@ -389,6 +417,7 @@ def main():
 
     def common(p):
         p.add_argument("--data", required=True, help="folder holding content.txt and wav.tar.gz")
+        p.add_argument("--limit", type=int, default=0, help="only the first N clips, no probes (0 = all)")
 
     def whisper_args(p):
         p.add_argument("--model", default="Systran/faster-whisper-large-v3", help="model name or local CTranslate2 folder")
@@ -400,6 +429,7 @@ def main():
     def qwen_args(p):
         p.add_argument("--url", default="http://127.0.0.1:8000", help="OpenAI-compatible server base URL")
         p.add_argument("--served-model", default="qwen3-asr", help="model name the server expects")
+        p.add_argument("--wav", action="store_true", help="send 16 kHz WAV (needed for llama.cpp's llama-server)")
 
     p = sub.add_parser("prepare"); common(p)
     p.add_argument("--n", type=int, default=500)
