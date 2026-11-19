@@ -143,3 +143,9 @@ second during the `perf` runs.
 [OpenCC](https://github.com/BYVoid/OpenCC)
 
 Dependencies, models and the dataset keep their own licences.
+
+## License
+
+MIT, see [LICENSE](LICENSE). It covers the script and the text in this repository only. The WSYue-ASR-eval
+dataset (CC BY-NC 4.0) is not included, and transcripts you produce from its audio fall under its licence;
+models and dependencies keep their own licences.
